@@ -3,10 +3,11 @@ import json
 from google import genai
 from google.genai import types
 from .base_provider import BaseProvider
+from google.genai.errors import ServerError
 
 class GeminiProvider(BaseProvider):
     def _format_messages(self, messages):
-        """Translates and strictly groups OpenAI messages into Gemini's alternating structure."""
+        """Translates OpenAI messages into Gemini format, flattening tool history into plain text to prevent 500 crashes."""
         system_instruction = None
         gemini_contents = []
         
@@ -25,50 +26,54 @@ class GeminiProvider(BaseProvider):
             gemini_role = "user" if role in ["user", "tool"] else "model"
             new_parts = []
             
-            # 1. Handle Tool Execution Results
+            # 1. Handle Tool Execution Results (Flattened to Plain Text)
             if role == "tool":
-                new_parts.append(
-                    types.Part.from_function_response(
-                        name=msg.get("name", "unknown_tool"),
-                        response={"result": msg.get("content", "")}
-                    )
-                )
-            else:
-                # 2. Handle Text Content
-                content = msg.get("content")
-                if content:
-                    new_parts.append(types.Part.from_text(text=str(content)))
+                raw_result = msg.get("content", "")
+                if not raw_result or str(raw_result).strip() == "":
+                    raw_result = "Success (no output returned)."
                 
-                # 3. Handle Tool Calls made by the assistant
+                # Truncate massive outputs
+                if len(str(raw_result)) > 20000:
+                    raw_result = str(raw_result)[:20000] + "\n\n...[OUTPUT TRUNCATED BY PROXY]..."
+                
+                tool_name = msg.get("name", msg.get("tool_call_id", "unknown_tool"))
+                text_repr = f"\n[System Context: Tool Result for '{tool_name}']: \n{raw_result}\n"
+                new_parts.append(types.Part.from_text(text=text_repr))
+                
+            # 2. Handle Text Content and Assistant Tool Calls (Flattened to Plain Text)
+            else:
+                content = msg.get("content")
+                if content is not None and str(content).strip() != "":
+                    new_parts.append(types.Part.from_text(text=str(content)))
+                elif content is not None and str(content).strip() == "":
+                    new_parts.append(types.Part.from_text(text="[Empty Message]"))
+                
                 if role == "assistant" and "tool_calls" in msg:
                     for tc in msg["tool_calls"]:
                         func = tc.get("function", {})
                         args = func.get("arguments", "{}")
-                        # Safely parse JSON arguments
-                        args_dict = json.loads(args) if isinstance(args, str) else args
-                        new_parts.append(
-                            types.Part.from_function_call(
-                                name=func.get("name"),
-                                args=args_dict
-                            )
-                        )
+                        tc_name = func.get("name", "unknown_tool")
+                        text_repr = f"\n[System Context: I decided to execute tool '{tc_name}' with arguments: {args}]\n"
+                        new_parts.append(types.Part.from_text(text=text_repr))
             
             if not new_parts:
                 continue
 
-            # Grouping logic: If the role is the same as the current block, combine them!
+            # Grouping logic (The Zipper)
             if gemini_role == current_role:
                 current_parts.extend(new_parts)
             else:
-                # Role changed: Save the previous block and start a new one
                 if current_role is not None:
                     gemini_contents.append(types.Content(role=current_role, parts=current_parts))
                 current_role = gemini_role
                 current_parts = new_parts
 
-        # Don't forget to append the final accumulated block
         if current_role is not None:
             gemini_contents.append(types.Content(role=current_role, parts=current_parts))
+
+        # FINAL SAFETY GUARD: Gemini history MUST start with a 'user' message
+        if gemini_contents and gemini_contents[0].role == "model":
+            gemini_contents.insert(0, types.Content(role="user", parts=[types.Part.from_text(text="Let's begin.")]))
 
         return system_instruction, gemini_contents
         
@@ -148,47 +153,71 @@ class GeminiProvider(BaseProvider):
         sys_inst, contents = self._format_messages(messages)
         gemini_tools = self._parse_tools(kwargs.get("tools"))
         
-        stream = client.models.generate_content_stream(
-            model=model,
-            contents=contents,
-            config=types.GenerateContentConfig(
-                system_instruction=sys_inst,
-                temperature=kwargs.get("temperature", 0.7),
-                tools=gemini_tools
-            )
-        )
+        max_retries = 3
+        retry_delay = 2  # seconds
         
-        for chunk in stream:
-            delta = {}
-            finish_reason = None
+        for attempt in range(max_retries):
+            try:
+                stream = client.models.generate_content_stream(
+                    model=model,
+                    contents=contents,
+                    config=types.GenerateContentConfig(
+                        system_instruction=sys_inst,
+                        temperature=kwargs.get("temperature", 0.7),
+                        tools=gemini_tools
+                    )
+                )
+                
+                for chunk in stream:
+                    delta = {}
+                    finish_reason = None
 
-            # 1. Yield any text tokens
-            if chunk.text:
-                delta["content"] = chunk.text
-            
-            # 2. Yield any tool calls
-            if chunk.function_calls:
-                tool_calls_formatted = []
-                for index, fc in enumerate(chunk.function_calls):
-                    tool_calls_formatted.append({
-                        "index": index,
-                        "id": f"call_{int(time.time())}_{fc.name}",
-                        "type": "function",
-                        "function": {
-                            "name": fc.name,
-                            "arguments": json.dumps(fc.args)
+                    if chunk.text:
+                        delta["content"] = chunk.text
+                    
+                    if chunk.function_calls:
+                        tool_calls_formatted = []
+                        for index, fc in enumerate(chunk.function_calls):
+                            # Capture Google's native ID if it exists, otherwise fall back
+                            fc_id = getattr(fc, 'id', None) or f"call_{int(time.time())}_{fc.name}"
+                            
+                            tool_calls_formatted.append({
+                                "index": index,
+                                "id": fc_id,
+                                "type": "function",
+                                "function": {
+                                    "name": fc.name,
+                                    "arguments": json.dumps(fc.args)
+                                }
+                            })
+                        delta["tool_calls"] = tool_calls_formatted
+                        finish_reason = "tool_calls"
+
+                    if delta:
+                        data = {
+                            "id": f"chatcmpl-{int(time.time())}",
+                            "object": "chat.completion.chunk",
+                            "model": model,
+                            "choices": [{"delta": delta, "finish_reason": finish_reason}]
                         }
-                    })
-                delta["tool_calls"] = tool_calls_formatted
-                finish_reason = "tool_calls"
-
-            if delta:
-                data = {
-                    "id": f"chatcmpl-{int(time.time())}",
-                    "object": "chat.completion.chunk",
-                    "model": model,
-                    "choices": [{"delta": delta, "finish_reason": finish_reason}]
-                }
-                yield f"data: {json.dumps(data)}\n\n"
+                        yield f"data: {json.dumps(data)}\n\n"
+                
+                # If the stream finished successfully, break out of the retry loop
+                break
+                
+            except ServerError as e:
+                # Safely convert the error to a string to check the status code
+                error_str = str(e)
+                
+                # Check if it's a 503 high demand error
+                if '503' in error_str and attempt < max_retries - 1:
+                    print(f"[Proxy] Google 503 error encountered. Retrying in {retry_delay}s (Attempt {attempt + 1}/{max_retries})...")
+                    time.sleep(retry_delay)
+                    retry_delay *= 2  # Exponential backoff
+                    continue
+                else:
+                    # If it's a 500 INTERNAL or we ran out of retries, print it and raise
+                    print(f"[Proxy] Unrecoverable Google API Error: {error_str}")
+                    raise e
         
         yield "data: [DONE]\n\n"

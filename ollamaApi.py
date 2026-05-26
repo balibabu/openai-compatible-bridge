@@ -6,9 +6,13 @@ from google import genai
 from google.genai import types
 
 app = Flask(__name__)
+import os
+api_key = os.getenv("GAPI")
 
 try:
-    client = genai.Client()
+    client = genai.Client(api_key=api_key)
+    models = client.models.list()
+    tags=[{"name": model.name.split('/')[1], "model": model.name.split('/')[1], "modified_at": '2026-05-26T05:07:21.206423+00:00', "size": 0, "digest": "mock"} for model in models]
 except Exception as e:
     print(f"Error initializing client: {e}. Did you set GEMINI_API_KEY?")
     exit(1)
@@ -18,14 +22,10 @@ def get_current_time():
 
 @app.route('/api/tags', methods=['GET'])
 def list_models():
-    """Allows Cline to verify connection."""
-    return jsonify({
-        "models": [{"name": "mymodel", "model": "mymodel", "modified_at": get_current_time(), "size": 0, "digest": "mock"}]
-    })
+    return jsonify({ "models": tags })
 
 @app.route('/api/show', methods=['POST'])
 def show_model_info():
-    """Provides metadata about the model."""
     return jsonify({"modelfile": "FROM mymodel", "parameters": "", "template": "{{ .Prompt }}"})
 
 @app.route('/api/chat', methods=['POST'])
@@ -60,7 +60,7 @@ def chat():
         def generate_stream():
             try:
                 response_stream = client.models.generate_content_stream(
-                    model='gemini-2.5-flash', 
+                    model=model, 
                     contents=gemini_contents,
                     config=config
                 )
@@ -68,7 +68,7 @@ def chat():
                 for chunk in response_stream:
                     if chunk.text:
                         response_obj = {
-                            "model": model,
+                            "model": 'mymodel',
                             "created_at": get_current_time(),
                             "message": {"role": "assistant", "content": chunk.text},
                             "done": False
@@ -77,7 +77,7 @@ def chat():
                 
                 # Ollama requires a final 'done': True message
                 final_obj = {
-                    "model": model,
+                    "model": 'mymodel',
                     "created_at": get_current_time(),
                     "message": {"role": "assistant", "content": ""},
                     "done": True,
@@ -87,7 +87,7 @@ def chat():
                 
             except Exception as e:
                 error_obj = {
-                    "model": model,
+                    "model": 'mymodel',
                     "created_at": get_current_time(),
                     "message": {"role": "assistant", "content": f"\n\n[API Error: {str(e)}]"},
                     "done": True
@@ -97,4 +97,4 @@ def chat():
         return Response(generate_stream(), mimetype='application/x-ndjson')
 
 if __name__ == '__main__':
-    app.run(port=5000, debug=True)
+    app.run(port=5050, debug=True)
